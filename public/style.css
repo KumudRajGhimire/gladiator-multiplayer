@@ -1,0 +1,20 @@
+body {
+    margin: 0;
+    overflow: hidden; /* No scrollbars */
+    background-color: #121212; /* Dark background */
+    color: white;
+    font-family: 'Courier New', Courier, monospace;
+}
+
+canvas {
+    display: block;
+}
+
+#ui {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    pointer-events: none; /* Let clicks pass through to game */
+    font-size: 18px;
+    text-shadow: 1px 1px 0 #000;
+}

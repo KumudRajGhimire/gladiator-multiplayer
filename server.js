@@ -1,7 +1,12 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
-const io = require('socket.io')(http);
+// SECURITY: Limit packet size to 1KB to prevent massive data attacks
+const io = require('socket.io')(http, {
+    maxHttpBufferSize: 1e3, 
+    pingTimeout: 10000,
+    pingInterval: 5000
+});
 
 app.use(express.static('public'));
 
@@ -13,44 +18,60 @@ const PLAYER_RADIUS = 25;
 // Physics Config
 const WALK_SPEED = 7;
 const RUN_SPEED = 21;
-const DASH_FORCE = 70;
 const ACCELERATION = 2;    
 const FRICTION = 0.85;
 
-// Cooldowns
+// Game Rules
 const ATTACK_COOLDOWN = 400; 
-const DASH_COOLDOWN = 800;  
+const RESPAWN_TIME = 3000; 
 const WIN_SCORE = 5; 
+const MAX_PLAYERS = 20; // Cap total players to prevent memory overflow
 
-// --- SECURITY SETTINGS ---
-const MAX_PACKETS_PER_SEC = 500; // If they send more than 50 commands/sec, kick them
-const ALLOW_ONE_PER_IP = true;  // Set to false if testing locally
+// --- SECURITY ---
+const MAX_PACKETS_PER_SEC = 100; // Strict limit
+const ALLOW_ONE_PER_IP = true;   // Set TRUE for production security
 
 // --- STATE ---
 let players = {};
 let rooms = {}; 
-let connectedIPs = {}; // Track IPs to prevent multi-tabbing
+let connectedIPs = {}; 
+let healthDrops = {}; 
+let dropIdCounter = 0;
+
+// --- GLOBAL CRASH HANDLER (The "Do Not Die" Shield) ---
+process.on('uncaughtException', (err) => {
+    console.log('CAUGHT EXCEPTION:', err);
+    // We catch the error so the server stays alive
+});
 
 io.on('connection', (socket) => {
-    // 1. GET REAL IP ADDRESS (Works on Render/Heroku proxies)
-    const rawIp = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-    // If multiple IPs are listed (proxy chain), take the first one
-    const userIp = rawIp.split(',')[0].trim();
+    // 1. IP CHECK
+    let userIp = "unknown";
+    try {
+        const rawIp = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+        userIp = rawIp.split(',')[0].trim();
+    } catch (e) {}
 
-    console.log(`Connection attempt: ${socket.id} from ${userIp}`);
-
-    // 2. IP LIMITING CHECK
+    console.log(`Connection: ${socket.id} from ${userIp}`);
+    
     if (ALLOW_ONE_PER_IP && connectedIPs[userIp]) {
         console.log(`Blocked duplicate IP: ${userIp}`);
-        socket.emit('error', 'Only one active game per IP address allowed.');
+        socket.disconnect(true); return;
+    }
+    
+    // Only track IP if not localhost (for testing)
+    if (userIp !== "::1" && userIp !== "127.0.0.1") {
+        connectedIPs[userIp] = true;
+    }
+
+    // 2. CHECK SERVER CAPACITY
+    if (Object.keys(players).length >= MAX_PLAYERS) {
+        socket.emit('error', 'Server Full');
         socket.disconnect(true);
         return;
     }
-    
-    // Mark IP as active
-    connectedIPs[userIp] = true;
 
-    // 3. PACKET RATE LIMITER (Anti-Spam)
+    // 3. RATE LIMITER
     let packetCount = 0;
     const rateLimitInterval = setInterval(() => {
         if (packetCount > MAX_PACKETS_PER_SEC) {
@@ -59,100 +80,113 @@ io.on('connection', (socket) => {
         }
         packetCount = 0;
     }, 1000);
+    
+    socket.use((p, n) => { packetCount++; n(); });
 
-    // Middleware to count every packet they send
-    socket.use((packet, next) => {
-        packetCount++;
-        next();
-    });
+    // --- HANDLERS WITH ERROR PROTECTION ---
 
     socket.on('joinGame', (data) => {
-        // Sanitize Input Name (Prevent HTML injection or huge names)
-        let safeName = (data.name || "Gladiator").replace(/[^a-zA-Z0-9 ]/g, "");
-        const roomId = data.room || "global";
-        
-        socket.join(roomId);
+        try {
+            // Validate Data
+            if (!data || typeof data !== 'object') return;
+            
+            let rawName = data.name || "Gladiator";
+            // Strip all non-alphanumeric chars to prevent injection
+            let safeName = String(rawName).replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 12);
+            
+            let rawRoom = data.room || "global";
+            let safeRoom = String(rawRoom).replace(/[^a-zA-Z0-9]/g, "").substring(0, 6);
 
-        if (!rooms[roomId]) rooms[roomId] = { isResetting: false };
+            socket.join(safeRoom);
+            if (!rooms[safeRoom]) rooms[safeRoom] = { isResetting: false };
 
-        players[socket.id] = {
-            id: socket.id,
-            room: roomId,
-            name: safeName.substring(0, 10),
-            x: 0, y: 0,
-            vx: 0, vy: 0,
-            angle: 0,
-            hp: 100,
-            score: 0,
-            inputs: { w: false, a: false, s: false, d: false, shift: false },
-            lastAttack: 0,
-            lastDash: 0
-        };
-        socket.emit('gameJoined');
+            players[socket.id] = {
+                id: socket.id,
+                room: safeRoom,
+                name: safeName,
+                x: 0, y: 0,
+                vx: 0, vy: 0,
+                angle: 0,
+                color: getRandomColor(), // Using helper function
+                hp: 100,
+                score: 0,
+                inputs: { w: false, a: false, s: false, d: false, shift: false },
+                lastAttack: 0,
+                isDead: false,
+                respawnTime: 0
+            };
+            socket.emit('gameJoined');
+            socket.emit('healthDropsUpdate', filterDropsByRoom(safeRoom));
+        } catch (e) { console.log("Join Error", e); }
     });
 
     socket.on('input', (keys) => {
-        if (players[socket.id]) {
-            // 4. INPUT SANITIZATION
-            // Force values to be booleans. If hacker sends {w: 1000}, it becomes true/false.
-            players[socket.id].inputs = {
-                w: !!keys.w,
-                a: !!keys.a,
-                s: !!keys.s,
-                d: !!keys.d,
-                shift: !!keys.shift
-            };
-        }
+        try {
+            if (players[socket.id] && keys && typeof keys === 'object') {
+                // Force Boolean (True/False) to prevent weird data
+                players[socket.id].inputs = {
+                    w: !!keys.w, a: !!keys.a, s: !!keys.s, d: !!keys.d, shift: !!keys.shift
+                };
+            }
+        } catch (e) {}
     });
 
-    socket.on('aim', (angle) => {
-        // Ensure angle is a Number
-        if (players[socket.id] && typeof angle === 'number') {
-            players[socket.id].angle = angle;
-        }
+    socket.on('aim', (a) => { 
+        try {
+            if (players[socket.id] && typeof a === 'number' && !isNaN(a)) {
+                players[socket.id].angle = a; 
+            }
+        } catch(e) {}
     });
 
     socket.on('attack', () => {
-        const p = players[socket.id];
-        if (!p || rooms[p.room].isResetting) return;
-        
-        const now = Date.now();
-        if (now - p.lastAttack < ATTACK_COOLDOWN) return;
-        p.lastAttack = now;
-        checkCombat(p);
-    });
-
-    socket.on('dash', () => {
-        const p = players[socket.id];
-        if (!p || rooms[p.room].isResetting) return;
-
-        const now = Date.now();
-        if (now - p.lastDash < DASH_COOLDOWN) return;
-        p.lastDash = now;
-
-        p.vx = Math.cos(p.angle) * DASH_FORCE;
-        p.vy = Math.sin(p.angle) * DASH_FORCE;
+        try {
+            const p = players[socket.id];
+            if (!p || p.isDead || rooms[p.room].isResetting) return;
+            
+            const now = Date.now();
+            if (now - p.lastAttack < ATTACK_COOLDOWN) return;
+            p.lastAttack = now;
+            checkCombat(p);
+        } catch(e) {}
     });
 
     socket.on('disconnect', () => {
-        console.log(`Disconnected: ${socket.id}`);
-        // Clear IP lock so they can join again
         delete connectedIPs[userIp];
         clearInterval(rateLimitInterval);
-        
         if (players[socket.id]) delete players[socket.id];
     });
 });
 
-// --- PHYSICS LOOP ---
+// --- HELPER FUNCTIONS ---
+function getRandomColor() {
+    const isArmor = Math.random() > 0.5;
+    if (isArmor) return `hsl(210, ${Math.random() * 15}%, ${40 + Math.random() * 30}%)`;
+    return `hsl(${25 + Math.random() * 15}, ${50 + Math.random() * 30}%, ${30 + Math.random() * 20}%)`;
+}
+
 setInterval(() => {
     let roomPackets = {};
 
     for (let id in players) {
         let p = players[id];
+        if (!p.room) continue; // Safety check
+        
         if (!roomPackets[p.room]) roomPackets[p.room] = {};
-        if (rooms[p.room].isResetting) {
-            roomPackets[p.room][id] = p; 
+        if (rooms[p.room] && rooms[p.room].isResetting) { roomPackets[p.room][id] = p; continue; }
+        
+        // Respawn Logic
+        if (p.isDead) {
+            if (Date.now() > p.respawnTime) {
+                p.isDead = false;
+                p.hp = 100;
+                const spawnAngle = Math.random() * Math.PI * 2;
+                const spawnDist = Math.random() * (MAP_RADIUS - 50);
+                p.x = Math.cos(spawnAngle) * spawnDist;
+                p.y = Math.sin(spawnAngle) * spawnDist;
+                io.to(p.room).emit('playerRespawned', { id: p.id });
+            }
+            roomPackets[p.room][id] = p;
             continue;
         }
 
@@ -163,20 +197,15 @@ setInterval(() => {
         if (p.inputs.a) p.vx -= ACCELERATION;
         if (p.inputs.d) p.vx += ACCELERATION;
 
-        p.vx *= FRICTION; 
-        p.vy *= FRICTION;
+        p.vx *= FRICTION; p.vy *= FRICTION;
 
         const currentSpeed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
         if (currentSpeed > currentMaxSpeed) {
-            if (currentSpeed < DASH_FORCE - 5) {
-                const scale = currentMaxSpeed / currentSpeed;
-                p.vx *= scale;
-                p.vy *= scale;
-            }
+             const scale = currentMaxSpeed / currentSpeed;
+             p.vx *= scale; p.vy *= scale;
         }
 
-        p.x += p.vx;
-        p.y += p.vy;
+        p.x += p.vx; p.y += p.vy;
 
         const dist = Math.sqrt(p.x * p.x + p.y * p.y);
         if (dist + PLAYER_RADIUS > MAP_RADIUS) {
@@ -185,39 +214,56 @@ setInterval(() => {
             p.y = Math.sin(angle) * (MAP_RADIUS - PLAYER_RADIUS);
             p.vx *= -0.5; p.vy *= -0.5;
         }
+        
+        if (p.hp < 100) checkItemPickup(p);
 
         roomPackets[p.room][id] = p;
     }
 
-    for (let roomId in roomPackets) {
-        io.to(roomId).emit('update', roomPackets[roomId]);
-    }
+    for (let r in roomPackets) io.to(r).emit('update', roomPackets[r]);
 }, 1000 / TICK_RATE);
 
 function checkCombat(attacker) {
     const roomId = attacker.room;
     io.to(roomId).emit('playerAttacked', { id: attacker.id });
 
+    const speed = Math.sqrt(attacker.vx * attacker.vx + attacker.vy * attacker.vy);
+    let damage = 10 + (speed / RUN_SPEED) * 20;
+    if (damage < 10) damage = 10;
+    if (damage > 30) damage = 30;
+    
+    const knockbackForce = 20 + (speed * 1.5); 
+
     for (let id in players) {
         const target = players[id];
-        if (target.room !== roomId || target.id === attacker.id) continue;
+        if (target.room !== roomId || target.id === attacker.id || target.isDead) continue;
 
         const dx = target.x - attacker.x;
         const dy = target.y - attacker.y;
         const dist = Math.sqrt(dx*dx + dy*dy);
 
         if (dist < 60) {
-            target.hp -= 10;
+            target.hp -= Math.floor(damage);
             const hitAngle = Math.atan2(dy, dx);
-            target.vx += Math.cos(hitAngle) * 30; 
-            target.vy += Math.sin(hitAngle) * 30;
+            target.vx += Math.cos(hitAngle) * knockbackForce;
+            target.vy += Math.sin(hitAngle) * knockbackForce;
 
-            io.to(roomId).emit('hit', { id: target.id });
+            io.to(roomId).emit('hit', { id: target.id, dmg: Math.floor(damage) });
+            io.to(roomId).emit('bloodEffect', { x: target.x, y: target.y });
 
             if (target.hp <= 0) {
                 attacker.score++;
-                target.hp = 100;
-                target.x = 0; target.y = 0; target.vx = 0; target.vy = 0;
+                spawnHealthDrop(target.x, target.y, roomId);
+
+                target.isDead = true;
+                target.hp = 0;
+                target.vx = 0; target.vy = 0;
+                target.respawnTime = Date.now() + RESPAWN_TIME;
+
+                io.to(roomId).emit('playerDied', { 
+                    id: target.id, x: target.x, y: target.y, respawnIn: RESPAWN_TIME
+                });
+                io.to(target.id).emit('respawnTimer', RESPAWN_TIME);
 
                 if (attacker.score >= WIN_SCORE) {
                     io.to(roomId).emit('gameOver', attacker.name);
@@ -228,15 +274,50 @@ function checkCombat(attacker) {
     }
 }
 
+function spawnHealthDrop(x, y, room) {
+    const id = `drop_${dropIdCounter++}`;
+    healthDrops[id] = { x, y, room };
+    io.to(room).emit('healthDropsUpdate', filterDropsByRoom(room));
+}
+
+function checkItemPickup(p) {
+    for (let id in healthDrops) {
+        let drop = healthDrops[id];
+        if (drop.room !== p.room) continue;
+
+        const dx = p.x - drop.x;
+        const dy = p.y - drop.y;
+        if (Math.sqrt(dx*dx + dy*dy) < 30) {
+            p.hp = Math.min(p.hp + 50, 100); 
+            delete healthDrops[id];
+            io.to(p.room).emit('healthDropsUpdate', filterDropsByRoom(p.room));
+            return; 
+        }
+    }
+}
+
+function filterDropsByRoom(roomId) {
+    let roomDrops = {};
+    for (let id in healthDrops) {
+        if (healthDrops[id].room === roomId) roomDrops[id] = healthDrops[id];
+    }
+    return roomDrops;
+}
+
 function resetGame(roomId) {
     if (!rooms[roomId]) return;
     rooms[roomId].isResetting = true;
+    for(let id in healthDrops) {
+        if(healthDrops[id].room === roomId) delete healthDrops[id];
+    }
+    io.to(roomId).emit('healthDropsUpdate', {});
+
     setTimeout(() => {
         for (let id in players) {
             if (players[id].room === roomId) {
                 players[id].score = 0; players[id].hp = 100;
-                players[id].x = 0; players[id].y = 0;
-                players[id].vx = 0; players[id].vy = 0;
+                players[id].isDead = false;
+                players[id].x = 0; players[id].y = 0; players[id].vx = 0; players[id].vy = 0;
             }
         }
         if (rooms[roomId]) rooms[roomId].isResetting = false;

@@ -2,22 +2,50 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Gladiator Arena</title>
+    <title>Gladiator Pit</title>
     <style>
         body { margin: 0; overflow: hidden; background: #111; color: white; font-family: 'Arial', sans-serif; }
         canvas { display: block; }
         
-        /* THE START SCREEN OVERLAY */
+        /* START SCREEN CONTAINER */
         #start-screen {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0, 0, 0, 0.95);
+            /* Removed solid background */
             display: flex; flex-direction: column;
-            justify-content: center; align-items: center; z-index: 10;
+            justify-content: center; align-items: center; 
+            z-index: 10;
+            overflow: hidden; /* Prevents blur edges from showing scrollbars */
         }
 
+        /* 1. THE BACKGROUND GIF (Blurred) */
+        #start-screen::before {
+            content: "";
+            position: absolute;
+            /* Negative margins prevent white edges caused by the blur filter */
+            top: -20px; left: -20px; right: -20px; bottom: -20px;
+            background: url('bg.gif') no-repeat center center;
+            background-size: cover;
+            filter: blur(8px); /* <--- CHANGE BLUR AMOUNT HERE */
+            z-index: -2;
+        }
+
+        /* 2. DARK OVERLAY (To make text readable) */
+        #start-screen::after {
+            content: "";
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 0, 0, 0.5); /* 50% Darkness */
+            z-index: -1;
+        }
+
+        /* THE LOGIN BOX */
         .box {
-            background: #222; padding: 40px; border: 3px solid #8B4513;
-            border-radius: 10px; text-align: center; box-shadow: 0 0 30px rgba(0,0,0,0.8);
+            background: rgba(34, 34, 34, 0.9); /* Slight transparency */
+            padding: 40px; 
+            border: 3px solid #8B4513;
+            border-radius: 10px; 
+            text-align: center; 
+            box-shadow: 0 0 50px rgba(0,0,0,0.9);
+            backdrop-filter: blur(5px); /* Nice glass effect on the box itself */
         }
 
         h1 { margin: 0 0 20px 0; color: gold; text-transform: uppercase; letter-spacing: 5px; text-shadow: 2px 2px 0 #000; }
@@ -35,25 +63,46 @@
         }
         button:hover { background: #A0522D; transform: scale(1.05); }
 
-        #ui-layer { position: absolute; top: 10px; left: 10px; pointer-events: none; z-index: 5; display: none; }
-        #scoreboard { font-size: 18px; font-weight: bold; text-shadow: 1px 1px 2px black; }
+        /* LEADERBOARD & UI */
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; display: none; }
+        
+        #scoreboard {
+            position: absolute; top: 10px; right: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px; border-radius: 8px; min-width: 200px;
+            pointer-events: none;
+        }
+
+        #displayRoom {
+            position: absolute; top: 10px; left: 10px;
+            font-size: 14px; color: rgba(255,255,255,0.5);
+        }
+
+        .lb-row {
+            display: flex; justify-content: space-between;
+            margin-bottom: 5px; font-size: 14px;
+            border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;
+        }
+        .lb-row.me { color: #FFD700; font-weight: bold; }
+        .lb-hp { color: #ff5555; margin-right: 10px; }
+        .lb-score { color: #55ff55; }
     </style>
 </head>
 <body>
 
     <div id="start-screen">
         <div class="box">
-            <h1>Gladiator Arena</h1>
+            <h1>Gladiator Pit</h1>
             <input type="text" id="usernameInput" placeholder="Your Name" maxlength="10">
             <input type="text" id="roomInput" placeholder="Room Code (e.g. 123)">
             <button onclick="joinGame()">ENTER ARENA</button>
-            <p style="color: #666; font-size: 12px; margin-top: 20px;">Controls: WASD Move, Shift Run, Left Click Attack</p>
+            <p style="color: #aaa; font-size: 12px; margin-top: 20px;">WASD to Move • Shift to Run • Click to Attack</p>
         </div>
     </div>
 
     <div id="ui-layer">
-        <div id="scoreboard">Waiting...</div>
-        <div style="font-size: 12px; opacity: 0.5;">Room: <span id="displayRoom"></span></div>
+        <div id="displayRoom"></div>
+        <div id="scoreboard"></div> 
     </div>
 
     <canvas id="gameCanvas"></canvas>

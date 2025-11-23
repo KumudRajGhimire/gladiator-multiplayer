@@ -127,6 +127,9 @@ function checkCombat(attackerId) {
     }
 }
 
-http.listen(3000, () => {
-    console.log('Gladiator Server (Circular Mode) running on *:3000');
+// Use the port Render assigns, OR use 3000 if running locally
+const PORT = process.env.PORT || 3000; 
+
+http.listen(PORT, () => {
+    console.log(`Gladiator Server running on port ${PORT}`);
 });

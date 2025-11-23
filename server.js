@@ -5,131 +5,243 @@ const io = require('socket.io')(http);
 
 app.use(express.static('public'));
 
-// --- GAME CONSTANTS ---
+// --- CONSTANTS ---
 const TICK_RATE = 60;
-
-// CIRCLE SETTINGS
-const MAP_RADIUS = 500; // The size of the circular pit
+const MAP_RADIUS = 470; 
 const PLAYER_RADIUS = 25;
 
-const MOVEMENT_SPEED = 1.5;
-const FRICTION = 0.88; 
-const KNOCKBACK = 30;
+// Physics Config
+const WALK_SPEED = 7;
+const RUN_SPEED = 21;
+const DASH_FORCE = 70;
+const ACCELERATION = 2;    
+const FRICTION = 0.85;
 
+// Cooldowns
+const ATTACK_COOLDOWN = 400; 
+const DASH_COOLDOWN = 800;  
+const WIN_SCORE = 5; 
+
+// --- SECURITY SETTINGS ---
+const MAX_PACKETS_PER_SEC = 500; // If they send more than 50 commands/sec, kick them
+const ALLOW_ONE_PER_IP = true;  // Set to false if testing locally
+
+// --- STATE ---
 let players = {};
+let rooms = {}; 
+let connectedIPs = {}; // Track IPs to prevent multi-tabbing
 
 io.on('connection', (socket) => {
-    console.log('Gladiator connected:', socket.id);
+    // 1. GET REAL IP ADDRESS (Works on Render/Heroku proxies)
+    const rawIp = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    // If multiple IPs are listed (proxy chain), take the first one
+    const userIp = rawIp.split(',')[0].trim();
 
-    players[socket.id] = {
-        id: socket.id,
-        x: 0, y: 0,
-        vx: 0, vy: 0,
-        angle: 0,
-        color: `hsl(${Math.random() * 360}, 80%, 50%)`,
-        hp: 100,
-        score: 0,
-        inputs: { w: false, a: false, s: false, d: false }
-    };
+    console.log(`Connection attempt: ${socket.id} from ${userIp}`);
 
-    io.emit('update', players);
+    // 2. IP LIMITING CHECK
+    if (ALLOW_ONE_PER_IP && connectedIPs[userIp]) {
+        console.log(`Blocked duplicate IP: ${userIp}`);
+        socket.emit('error', 'Only one active game per IP address allowed.');
+        socket.disconnect(true);
+        return;
+    }
+    
+    // Mark IP as active
+    connectedIPs[userIp] = true;
+
+    // 3. PACKET RATE LIMITER (Anti-Spam)
+    let packetCount = 0;
+    const rateLimitInterval = setInterval(() => {
+        if (packetCount > MAX_PACKETS_PER_SEC) {
+            console.log(`Kicking spammer: ${socket.id}`);
+            socket.disconnect(true);
+        }
+        packetCount = 0;
+    }, 1000);
+
+    // Middleware to count every packet they send
+    socket.use((packet, next) => {
+        packetCount++;
+        next();
+    });
+
+    socket.on('joinGame', (data) => {
+        // Sanitize Input Name (Prevent HTML injection or huge names)
+        let safeName = (data.name || "Gladiator").replace(/[^a-zA-Z0-9 ]/g, "");
+        const roomId = data.room || "global";
+        
+        socket.join(roomId);
+
+        if (!rooms[roomId]) rooms[roomId] = { isResetting: false };
+
+        players[socket.id] = {
+            id: socket.id,
+            room: roomId,
+            name: safeName.substring(0, 10),
+            x: 0, y: 0,
+            vx: 0, vy: 0,
+            angle: 0,
+            hp: 100,
+            score: 0,
+            inputs: { w: false, a: false, s: false, d: false, shift: false },
+            lastAttack: 0,
+            lastDash: 0
+        };
+        socket.emit('gameJoined');
+    });
 
     socket.on('input', (keys) => {
-        if (players[socket.id]) players[socket.id].inputs = keys;
+        if (players[socket.id]) {
+            // 4. INPUT SANITIZATION
+            // Force values to be booleans. If hacker sends {w: 1000}, it becomes true/false.
+            players[socket.id].inputs = {
+                w: !!keys.w,
+                a: !!keys.a,
+                s: !!keys.s,
+                d: !!keys.d,
+                shift: !!keys.shift
+            };
+        }
     });
 
     socket.on('aim', (angle) => {
-        if (players[socket.id]) players[socket.id].angle = angle;
+        // Ensure angle is a Number
+        if (players[socket.id] && typeof angle === 'number') {
+            players[socket.id].angle = angle;
+        }
     });
 
     socket.on('attack', () => {
-        const attacker = players[socket.id];
-        if (!attacker) return;
+        const p = players[socket.id];
+        if (!p || rooms[p.room].isResetting) return;
         
-        // Dash Attack
-        attacker.vx += Math.cos(attacker.angle) * 20;
-        attacker.vy += Math.sin(attacker.angle) * 20;
+        const now = Date.now();
+        if (now - p.lastAttack < ATTACK_COOLDOWN) return;
+        p.lastAttack = now;
+        checkCombat(p);
+    });
 
-        checkCombat(socket.id);
+    socket.on('dash', () => {
+        const p = players[socket.id];
+        if (!p || rooms[p.room].isResetting) return;
+
+        const now = Date.now();
+        if (now - p.lastDash < DASH_COOLDOWN) return;
+        p.lastDash = now;
+
+        p.vx = Math.cos(p.angle) * DASH_FORCE;
+        p.vy = Math.sin(p.angle) * DASH_FORCE;
     });
 
     socket.on('disconnect', () => {
-        delete players[socket.id];
+        console.log(`Disconnected: ${socket.id}`);
+        // Clear IP lock so they can join again
+        delete connectedIPs[userIp];
+        clearInterval(rateLimitInterval);
+        
+        if (players[socket.id]) delete players[socket.id];
     });
 });
 
 // --- PHYSICS LOOP ---
 setInterval(() => {
+    let roomPackets = {};
+
     for (let id in players) {
         let p = players[id];
+        if (!roomPackets[p.room]) roomPackets[p.room] = {};
+        if (rooms[p.room].isResetting) {
+            roomPackets[p.room][id] = p; 
+            continue;
+        }
 
-        // 1. Move
-        if (p.inputs.w) p.vy -= MOVEMENT_SPEED;
-        if (p.inputs.s) p.vy += MOVEMENT_SPEED;
-        if (p.inputs.a) p.vx -= MOVEMENT_SPEED;
-        if (p.inputs.d) p.vx += MOVEMENT_SPEED;
+        let currentMaxSpeed = p.inputs.shift ? RUN_SPEED : WALK_SPEED;
 
-        p.vx *= FRICTION;
+        if (p.inputs.w) p.vy -= ACCELERATION;
+        if (p.inputs.s) p.vy += ACCELERATION;
+        if (p.inputs.a) p.vx -= ACCELERATION;
+        if (p.inputs.d) p.vx += ACCELERATION;
+
+        p.vx *= FRICTION; 
         p.vy *= FRICTION;
+
+        const currentSpeed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
+        if (currentSpeed > currentMaxSpeed) {
+            if (currentSpeed < DASH_FORCE - 5) {
+                const scale = currentMaxSpeed / currentSpeed;
+                p.vx *= scale;
+                p.vy *= scale;
+            }
+        }
+
         p.x += p.vx;
         p.y += p.vy;
 
-        // --- NEW: CIRCULAR COLLISION LOGIC ---
-        // Simple distance check from center (0,0)
         const dist = Math.sqrt(p.x * p.x + p.y * p.y);
-
-        // If distance + player radius > map radius, we hit the wall
         if (dist + PLAYER_RADIUS > MAP_RADIUS) {
-            // Calculate angle from center
             const angle = Math.atan2(p.y, p.x);
-            
-            // Push player back to the edge
             p.x = Math.cos(angle) * (MAP_RADIUS - PLAYER_RADIUS);
             p.y = Math.sin(angle) * (MAP_RADIUS - PLAYER_RADIUS);
-
-            // Bounce (Reverse velocity)
-            p.vx *= -0.5;
-            p.vy *= -0.5;
+            p.vx *= -0.5; p.vy *= -0.5;
         }
-        // -------------------------------------
+
+        roomPackets[p.room][id] = p;
     }
 
-    io.emit('update', players);
-
+    for (let roomId in roomPackets) {
+        io.to(roomId).emit('update', roomPackets[roomId]);
+    }
 }, 1000 / TICK_RATE);
 
-function checkCombat(attackerId) {
-    const p1 = players[attackerId];
-    
-    for (let id in players) {
-        if (id === attackerId) continue;
-        const p2 = players[id];
+function checkCombat(attacker) {
+    const roomId = attacker.room;
+    io.to(roomId).emit('playerAttacked', { id: attacker.id });
 
-        const dx = p2.x - p1.x;
-        const dy = p2.y - p1.y;
+    for (let id in players) {
+        const target = players[id];
+        if (target.room !== roomId || target.id === attacker.id) continue;
+
+        const dx = target.x - attacker.x;
+        const dy = target.y - attacker.y;
         const dist = Math.sqrt(dx*dx + dy*dy);
 
         if (dist < 60) {
-            p2.hp -= 10;
+            target.hp -= 10;
             const hitAngle = Math.atan2(dy, dx);
-            p2.vx += Math.cos(hitAngle) * KNOCKBACK;
-            p2.vy += Math.sin(hitAngle) * KNOCKBACK;
+            target.vx += Math.cos(hitAngle) * 30; 
+            target.vy += Math.sin(hitAngle) * 30;
 
-            io.emit('hit', { id: id });
+            io.to(roomId).emit('hit', { id: target.id });
 
-            if (p2.hp <= 0) {
-                p1.score++;
-                p2.hp = 100;
-                p2.x = 0; p2.y = 0;
-                p2.vx = 0; p2.vy = 0;
+            if (target.hp <= 0) {
+                attacker.score++;
+                target.hp = 100;
+                target.x = 0; target.y = 0; target.vx = 0; target.vy = 0;
+
+                if (attacker.score >= WIN_SCORE) {
+                    io.to(roomId).emit('gameOver', attacker.name);
+                    resetGame(roomId);
+                }
             }
         }
     }
 }
 
-// Use the port Render assigns, OR use 3000 if running locally
-const PORT = process.env.PORT || 3000; 
+function resetGame(roomId) {
+    if (!rooms[roomId]) return;
+    rooms[roomId].isResetting = true;
+    setTimeout(() => {
+        for (let id in players) {
+            if (players[id].room === roomId) {
+                players[id].score = 0; players[id].hp = 100;
+                players[id].x = 0; players[id].y = 0;
+                players[id].vx = 0; players[id].vy = 0;
+            }
+        }
+        if (rooms[roomId]) rooms[roomId].isResetting = false;
+    }, 5000);
+}
 
-http.listen(PORT, () => {
-    console.log(`Gladiator Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+http.listen(PORT, () => console.log(`Server running on port ${PORT}`));

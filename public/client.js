@@ -3,7 +3,7 @@ const canvas = document.getElementById('gameCanvas');
 const ctx = canvas.getContext('2d');
 
 // --- PHYSICS BOUNDARIES ---
-const MAP_RADIUS = 500; // Must match server.js
+const MAP_RADIUS = 500; 
 // --------------------------
 
 ctx.imageSmoothingEnabled = false; 
@@ -12,6 +12,25 @@ canvas.height = window.innerHeight;
 
 const spriteSheet = new Image();
 spriteSheet.src = '/sprites.png';
+
+// --- AUDIO LOADING ---
+const runSfx = new Audio('/run.wav');
+runSfx.loop = true; 
+runSfx.volume = 0.5; 
+
+const attackSfx = new Audio('/attack.wav');
+attackSfx.volume = 0.6;
+
+// NEW: Hit Sound
+const hitSfx = new Audio('/hit.wav');
+hitSfx.volume = 0.8;
+
+function playSound(audio) {
+    const clone = audio.cloneNode(); 
+    clone.volume = audio.volume;
+    clone.play().catch(e => {});
+}
+// ---------------------
 
 const SPRITE_SIZE = 32; 
 const DRAW_SIZE = 64;   
@@ -38,10 +57,15 @@ socket.on('update', (serverPlayers) => {
     }
 });
 
+// --- HIT EVENT LISTENER ---
 socket.on('hit', (data) => {
     if(playerAnimState[data.id]) {
+        // 1. Play Animation
         playerAnimState[data.id].action = 'HIT';
         playerAnimState[data.id].frame = 0;
+        
+        // 2. Play Sound
+        playSound(hitSfx);
     }
 });
 
@@ -75,6 +99,7 @@ window.addEventListener('mousedown', () => {
     if (playerAnimState[myId]) {
         playerAnimState[myId].action = 'ATTACK';
         playerAnimState[myId].frame = 0;
+        playSound(attackSfx);
     }
 });
 
@@ -100,9 +125,7 @@ function draw() {
     ctx.save();
     ctx.translate(canvas.width / 2, canvas.height / 2);
 
-    // --- CIRCULAR PIT DRAWING ---
-    
-    // A. Wall
+    // --- CIRCULAR PIT ---
     const WALL_THICKNESS = 40;
     ctx.beginPath();
     ctx.arc(0, 0, MAP_RADIUS + WALL_THICKNESS, 0, Math.PI * 2);
@@ -112,24 +135,22 @@ function draw() {
     ctx.strokeStyle = '#222';
     ctx.stroke();
 
-    // B. Floor (Matches Physics)
     ctx.beginPath();
     ctx.arc(0, 0, MAP_RADIUS, 0, Math.PI * 2);
     ctx.fillStyle = '#C2B280'; 
     ctx.fill();
 
-    // C. Border
     ctx.lineWidth = 6;
     ctx.strokeStyle = '#8B4513'; 
     ctx.stroke();
-
-    // D. Decoration
+    
+    // Decoration
     ctx.beginPath();
     ctx.arc(0, 0, 100, 0, Math.PI*2);
     ctx.strokeStyle = 'rgba(139, 69, 19, 0.2)';
     ctx.lineWidth = 10;
     ctx.stroke();
-    // ----------------------------
+    // ------------------
 
     for (let id in players) {
         const p = players[id];
@@ -138,10 +159,24 @@ function draw() {
         const animState = playerAnimState[id];
         
         const currentAction = getPlayerAction(p, animState);
+        
+        // --- SOUND LOGIC (Attack) ---
         if (currentAction !== animState.action) {
+            if (currentAction === 'ATTACK' && id !== myId) {
+                playSound(attackSfx);
+            }
             animState.action = currentAction;
             animState.frame = 0;
             animState.timer = 0;
+        }
+
+        // --- SOUND LOGIC (Run) ---
+        if (id === myId) {
+            if (animState.action === 'RUN') {
+                if (runSfx.paused) runSfx.play().catch(e => {}); 
+            } else {
+                if (!runSfx.paused) { runSfx.pause(); runSfx.currentTime = 0; }
+            }
         }
 
         const animConfig = ANIMATIONS[animState.action];
@@ -161,48 +196,30 @@ function draw() {
         ctx.translate(p.x, p.y);
 
         ctx.save();
-        if (isLookingLeft) {
-            ctx.scale(-1, 1); 
-        }
+        if (isLookingLeft) ctx.scale(-1, 1); 
         
         ctx.fillStyle = 'rgba(0,0,0,0.4)';
-        ctx.beginPath();
-        ctx.ellipse(0, 14, 12, 6, 0, 0, Math.PI*2);
-        ctx.fill();
+        ctx.beginPath(); ctx.ellipse(0, 14, 12, 6, 0, 0, Math.PI*2); ctx.fill();
 
         const srcX = animState.frame * SPRITE_SIZE;
         const srcY = animConfig.row * SPRITE_SIZE;
         
         try {
-            ctx.drawImage(
-                spriteSheet, 
-                srcX, srcY, SPRITE_SIZE, SPRITE_SIZE, 
-                -DRAW_SIZE/2, -DRAW_SIZE/2, DRAW_SIZE, DRAW_SIZE 
-            );
+            ctx.drawImage(spriteSheet, srcX, srcY, SPRITE_SIZE, SPRITE_SIZE, -DRAW_SIZE/2, -DRAW_SIZE/2, DRAW_SIZE, DRAW_SIZE);
         } catch (e) {}
         ctx.restore(); 
 
         ctx.save();
         ctx.rotate(p.angle); 
-        
         ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
-        ctx.beginPath();
-        ctx.moveTo(30, -5); 
-        ctx.lineTo(50, 0);   
-        ctx.lineTo(30, 5);   
-        ctx.fill();
+        ctx.beginPath(); ctx.moveTo(30, -5); ctx.lineTo(50, 0); ctx.lineTo(30, 5); ctx.fill();
         ctx.restore();
 
-        ctx.fillStyle = 'red';
-        ctx.fillRect(-20, -45, 40, 5);
-        ctx.fillStyle = '#0f0';
-        ctx.fillRect(-20, -45, 40 * (p.hp / 100), 5);
+        ctx.fillStyle = 'red'; ctx.fillRect(-20, -45, 40, 5);
+        ctx.fillStyle = '#0f0'; ctx.fillRect(-20, -45, 40 * (p.hp / 100), 5);
         
         if (id === myId) {
-            ctx.fillStyle = 'white';
-            ctx.font = '10px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.fillText("YOU", 0, -55);
+            ctx.fillStyle = 'white'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center'; ctx.fillText("YOU", 0, -55);
         }
 
         ctx.restore(); 

@@ -115,6 +115,8 @@ function checkCombat(attackerId) {
             p2.vx += Math.cos(hitAngle) * KNOCKBACK;
             p2.vy += Math.sin(hitAngle) * KNOCKBACK;
 
+            io.emit('hit', { id: id });
+
             if (p2.hp <= 0) {
                 p1.score++;
                 p2.hp = 100;

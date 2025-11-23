@@ -1,8 +1,12 @@
 const express = require('express');
 const app = express();
 const http = require('http').createServer(app);
-// SECURITY: Limit packet size to 1KB to prevent massive data attacks
+// Enable CORS for connection stability
 const io = require('socket.io')(http, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    },
     maxHttpBufferSize: 1e3, 
     pingTimeout: 10000,
     pingInterval: 5000
@@ -25,24 +29,20 @@ const FRICTION = 0.85;
 const ATTACK_COOLDOWN = 400; 
 const RESPAWN_TIME = 3000; 
 const WIN_SCORE = 5; 
-const MAX_PLAYERS = 20; // Cap total players to prevent memory overflow
 
 // --- SECURITY ---
-const MAX_PACKETS_PER_SEC = 100; // Strict limit
-const ALLOW_ONE_PER_IP = true;   // Set TRUE for production security
+const MAX_PACKETS_PER_SEC = 500; 
+const MAX_CONNECTIONS_PER_IP = 10; // Allow 10 friends on one Wi-Fi
 
 // --- STATE ---
 let players = {};
 let rooms = {}; 
-let connectedIPs = {}; 
+let ipCounts = {}; // CHANGED: Track count instead of boolean
 let healthDrops = {}; 
 let dropIdCounter = 0;
 
-// --- GLOBAL CRASH HANDLER (The "Do Not Die" Shield) ---
-process.on('uncaughtException', (err) => {
-    console.log('CAUGHT EXCEPTION:', err);
-    // We catch the error so the server stays alive
-});
+// Global Crash Handler
+process.on('uncaughtException', (err) => { console.log('Caught:', err); });
 
 io.on('connection', (socket) => {
     // 1. IP CHECK
@@ -53,52 +53,50 @@ io.on('connection', (socket) => {
     } catch (e) {}
 
     console.log(`Connection: ${socket.id} from ${userIp}`);
-    
-    if (ALLOW_ONE_PER_IP && connectedIPs[userIp]) {
-        console.log(`Blocked duplicate IP: ${userIp}`);
-        socket.disconnect(true); return;
-    }
-    
-    // Only track IP if not localhost (for testing)
-    if (userIp !== "::1" && userIp !== "127.0.0.1") {
-        connectedIPs[userIp] = true;
-    }
 
-    // 2. CHECK SERVER CAPACITY
-    if (Object.keys(players).length >= MAX_PLAYERS) {
-        socket.emit('error', 'Server Full');
+    // Initialize count if new
+    if (!ipCounts[userIp]) ipCounts[userIp] = 0;
+
+    // CHECK LIMIT
+    if (ipCounts[userIp] >= MAX_CONNECTIONS_PER_IP) {
+        console.log(`Blocked IP ${userIp} (Too many connections)`);
+        socket.emit('error', 'Too many connections from this IP.');
         socket.disconnect(true);
         return;
     }
 
-    // 3. RATE LIMITER
+    // Increment Count
+    ipCounts[userIp]++;
+
+    // 2. RATE LIMITER
     let packetCount = 0;
     const rateLimitInterval = setInterval(() => {
         if (packetCount > MAX_PACKETS_PER_SEC) {
-            console.log(`Kicking spammer: ${socket.id}`);
             socket.disconnect(true);
         }
         packetCount = 0;
     }, 1000);
-    
     socket.use((p, n) => { packetCount++; n(); });
 
-    // --- HANDLERS WITH ERROR PROTECTION ---
+    // --- HANDLERS ---
 
     socket.on('joinGame', (data) => {
         try {
-            // Validate Data
             if (!data || typeof data !== 'object') return;
             
             let rawName = data.name || "Gladiator";
-            // Strip all non-alphanumeric chars to prevent injection
             let safeName = String(rawName).replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 12);
-            
             let rawRoom = data.room || "global";
             let safeRoom = String(rawRoom).replace(/[^a-zA-Z0-9]/g, "").substring(0, 6);
 
             socket.join(safeRoom);
             if (!rooms[safeRoom]) rooms[safeRoom] = { isResetting: false };
+
+            // Random Armor/Leather Colors
+            const isArmor = Math.random() > 0.5;
+            let randomColor = isArmor 
+                ? `hsl(210, ${Math.random() * 15}%, ${40 + Math.random() * 30}%)`
+                : `hsl(${25 + Math.random() * 15}, ${50 + Math.random() * 30}%, ${30 + Math.random() * 20}%)`;
 
             players[socket.id] = {
                 id: socket.id,
@@ -107,7 +105,7 @@ io.on('connection', (socket) => {
                 x: 0, y: 0,
                 vx: 0, vy: 0,
                 angle: 0,
-                color: getRandomColor(), // Using helper function
+                color: randomColor,
                 hp: 100,
                 score: 0,
                 inputs: { w: false, a: false, s: false, d: false, shift: false },
@@ -117,13 +115,12 @@ io.on('connection', (socket) => {
             };
             socket.emit('gameJoined');
             socket.emit('healthDropsUpdate', filterDropsByRoom(safeRoom));
-        } catch (e) { console.log("Join Error", e); }
+        } catch (e) {}
     });
 
     socket.on('input', (keys) => {
         try {
-            if (players[socket.id] && keys && typeof keys === 'object') {
-                // Force Boolean (True/False) to prevent weird data
+            if (players[socket.id] && keys) {
                 players[socket.id].inputs = {
                     w: !!keys.w, a: !!keys.a, s: !!keys.s, d: !!keys.d, shift: !!keys.shift
                 };
@@ -132,11 +129,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('aim', (a) => { 
-        try {
-            if (players[socket.id] && typeof a === 'number' && !isNaN(a)) {
-                players[socket.id].angle = a; 
-            }
-        } catch(e) {}
+        try { if (players[socket.id] && typeof a === 'number' && !isNaN(a)) players[socket.id].angle = a; } catch(e) {}
     });
 
     socket.on('attack', () => {
@@ -152,30 +145,27 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        delete connectedIPs[userIp];
+        // Decrement IP Count
+        if (ipCounts[userIp]) {
+            ipCounts[userIp]--;
+            if (ipCounts[userIp] <= 0) delete ipCounts[userIp];
+        }
+
         clearInterval(rateLimitInterval);
         if (players[socket.id]) delete players[socket.id];
     });
 });
-
-// --- HELPER FUNCTIONS ---
-function getRandomColor() {
-    const isArmor = Math.random() > 0.5;
-    if (isArmor) return `hsl(210, ${Math.random() * 15}%, ${40 + Math.random() * 30}%)`;
-    return `hsl(${25 + Math.random() * 15}, ${50 + Math.random() * 30}%, ${30 + Math.random() * 20}%)`;
-}
 
 setInterval(() => {
     let roomPackets = {};
 
     for (let id in players) {
         let p = players[id];
-        if (!p.room) continue; // Safety check
+        if (!p.room) continue; 
         
         if (!roomPackets[p.room]) roomPackets[p.room] = {};
         if (rooms[p.room] && rooms[p.room].isResetting) { roomPackets[p.room][id] = p; continue; }
         
-        // Respawn Logic
         if (p.isDead) {
             if (Date.now() > p.respawnTime) {
                 p.isDead = false;
